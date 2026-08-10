@@ -3,322 +3,558 @@ import mesa
 
 
 class StudentAgent(mesa.Agent):
+
     def __init__(self, unique_id, model, B_init, E_init):
         super().__init__(unique_id, model)
 
-        # -------------------------
-        # 核心状态
-        # -------------------------
-        self.B = B_init          # 当前芭蕾基础能力 [0, 100]
-        self.E = E_init          # 教学内化效率 [0, 1]
-        self.C = 0               # 累计实际上课次数
+        # Current accumulated ballet foundation
+        self.B = B_init
 
-        # 不同课程等级的掌握度
-        self.M = {}              # {level: mastery}
+        # Learning / internalization effectiveness
+        self.E = E_init
 
-        # 每个等级历史最高掌握度，用于计算遗忘下限
-        self.M_peak = {}         # {level: peak_mastery}
+        # Total actual attendances
+        self.C = 0
 
-        # -------------------------
-        # 人口 / 留存状态
-        # -------------------------
-        self.active = True       # 是否仍属于课堂系统
+        # Raw latent mastery by curriculum level
+        self.M = {}
 
-        # 连续缺课次数
+        # Historical peak mastery by level
+        self.M_peak = {}
+
+        # Whether this student is still in the population
+        self.active = True
+
+        # Consecutive absences
         self.absence_streak = 0
 
-        # -------------------------
-        # 本节课状态
-        # -------------------------
-        self.Y = 0               # 本节课是否到场
+        # Early-stage absence after first attendance
+        self.early_absence_streak = 0
+
+        # Whether delayed return has ever happened
+        self.had_delayed_return = False
+
+        # Whether this student later became stable
+        # after a delayed return
+        self.stable_after_delayed_return = False
+
+        # Attendance this class
+        self.Y = 0
+
+        # Performance observed in current class
+        self.last_performance_ratio = np.nan
+
+
+    # ========================================================
+    # BASIC PROPERTIES
+    # ========================================================
 
     @property
     def b(self):
-        """标准化基础能力"""
         return self.B / 100.0
+
 
     @property
     def stage(self):
-        """
-        留存阶段：
-        new       = 只上过0-1次
-        returning = 已连续上过2次
-        stable    = 已连续上过>=3次
-        dropped   = 早期流失
-        """
+
         if not self.active:
             return "dropped"
-        elif self.C <= 1:
+
+        if self.C <= 1:
             return "new"
-        elif self.C == 2:
+
+        if self.C == 2:
             return "returning"
-        else:
-            return "stable"
+
+        return "stable"
+
 
     def is_new(self):
-        """
-        老师眼中的“新人”：
-        本节课第一次实际到场。
-        """
         return self.C == 0 and self.Y == 1
 
-    def attend(self):
-        """
-        决定本节课是否到场。
 
-        - 第一次来之后，30%概率连续来第二次；
-        - 已经连续来两次后，50%概率连续来第三次；
-        - 连续来满3次后成为稳定成员；
-        - 稳定成员每节课70%概率到场。
-        """
+    # ========================================================
+    # LATENT MASTERY
+    # ========================================================
+
+    def mastery_ratio(self, level):
+
+        target = self.model.get_level_target(level)
+
+        if target <= 0:
+            return 0.0
+
+        raw_mastery = self.M.get(level, 0.0)
+
+        return min(
+            1.0,
+            raw_mastery / target
+        )
+
+
+    # ========================================================
+    # OBSERVED PERFORMANCE
+    # ========================================================
+
+    def performance_ratio(self, level):
+
+        latent_mastery = self.mastery_ratio(level)
+
+        state_noise = (
+            self.model.performance_rng.normal(
+                0,
+                self.model.performance_sigma
+            )
+        )
+
+        observed_performance = np.clip(
+            latent_mastery + state_noise,
+            0.0,
+            1.0
+        )
+
+        self.last_performance_ratio = (
+            observed_performance
+        )
+
+        return observed_performance
+
+
+    # ========================================================
+    # ATTENDANCE
+    # ========================================================
+
+    def attend(self):
 
         if not self.active:
             self.Y = 0
             return 0
 
-        # C=0 的学生正常情况下是本节新生成学生，
-        # 会在 model.step() 中被强制设为到场。
+
+        # ----------------------------------------------------
+        # First-ever attendance
+        # ----------------------------------------------------
+
         if self.C == 0:
+
             self.Y = 1
             return 1
 
-        # 上过一次：是否连续来第二次
+
+        # ----------------------------------------------------
+        # Has attended once
+        # ----------------------------------------------------
+
         if self.C == 1:
-            if self.random.random() < self.model.first_return_prob:
-                self.Y = 1
-            else:
-                self.Y = 0
-                self.active = False
-            return self.Y
 
-        # 已经连续上过两次：是否来第三次
+            # Immediate return opportunity
+            if self.early_absence_streak == 0:
+
+                if (
+                    self.model.attendance_rng.random()
+                    < self.model.first_return_prob
+                ):
+
+                    self.Y = 1
+
+                else:
+
+                    self.Y = 0
+                    self.early_absence_streak = 1
+
+                return self.Y
+
+
+            # ------------------------------------------------
+            # Delayed-return window
+            # ------------------------------------------------
+
+            if (
+                self.early_absence_streak
+                <= self.model.delayed_return_window
+            ):
+
+                if (
+                    self.model.attendance_rng.random()
+                    < self.model.delayed_return_prob
+                ):
+
+                    self.Y = 1
+
+                    self.had_delayed_return = True
+
+                    self.early_absence_streak = 0
+
+                    return 1
+
+                else:
+
+                    self.Y = 0
+
+                    self.early_absence_streak += 1
+
+                    if (
+                        self.early_absence_streak
+                        > self.model.delayed_return_window
+                    ):
+
+                        self.active = False
+
+                    return 0
+
+
+        # ----------------------------------------------------
+        # Has attended twice
+        # ----------------------------------------------------
+
         if self.C == 2:
-            if self.random.random() < self.model.second_return_prob:
+
+            if (
+                self.model.attendance_rng.random()
+                < self.model.second_return_prob
+            ):
+
                 self.Y = 1
+
             else:
+
                 self.Y = 0
                 self.active = False
+
             return self.Y
 
-        # 连续来满三次：稳定成员，允许偶尔缺课
+
+        # ----------------------------------------------------
+        # Stable student
+        # ----------------------------------------------------
+
         self.Y = (
             1
-            if self.random.random() < self.model.stable_attend_prob
+            if (
+                self.model.attendance_rng.random()
+                < self.model.stable_attend_prob
+            )
             else 0
         )
 
         return self.Y
 
-    def learn(self, D_t):
-        """
-        按本节课实际教学难度 D_t 学习。
-        """
+
+    # ========================================================
+    # LEARNING
+    # ========================================================
+
+    def learn(self, teaching_level):
 
         if self.Y == 0 or not self.active:
             return
 
-        # 第一次学习这个 level
-        if D_t not in self.M:
-            self.M[D_t] = 0.0
-            self.M_peak[D_t] = 0.0
 
-        # 单节随机状态波动
-        epsilon = self.model.np_random.normal(
-            0,
-            self.model.sigma
-        )
+        if teaching_level not in self.M:
 
-        # 学习增量
+            self.M[teaching_level] = 0.0
+            self.M_peak[teaching_level] = 0.0
+
+
+        # Latent mastery accumulation.
+        # Day-to-day performance noise does not enter here.
+        #
+        # Attending a class cannot reduce already
+        # internalized mastery.
+
         delta = (
             self.model.alpha * self.b
             + self.model.gamma * self.E
-            - self.model.beta * D_t
-            + epsilon
+            - self.model.beta * teaching_level
         )
 
-        self.M[D_t] = np.clip(
-            self.M[D_t] + delta,
-            0,
-            100
+        delta = max(
+            0.0,
+            delta
         )
 
-        # 更新该等级历史最高 mastery
-        self.M_peak[D_t] = max(
-            self.M_peak.get(D_t, 0),
-            self.M[D_t]
+
+        target = self.model.get_level_target(
+            teaching_level
         )
+
+
+        self.M[teaching_level] = np.clip(
+            self.M[teaching_level] + delta,
+            0.0,
+            target
+        )
+
+
+        self.M_peak[teaching_level] = max(
+            self.M_peak.get(
+                teaching_level,
+                0.0
+            ),
+            self.M[teaching_level]
+        )
+
+
+    # ========================================================
+    # FORGETTING
+    # ========================================================
 
     def forget(self):
-        """
-        连续缺课造成加速遗忘。
-
-        第1次缺课：-2
-        第2次：-4
-        第3次：-6
-        第4次及以后：每次最多-8
-
-        但 mastery 不低于该 level
-        历史最高掌握度的50%。
-        """
 
         self.absence_streak += 1
 
-        forgetting = min(
+
+        forgetting_amount = min(
             self.model.forgetting_base
             * self.absence_streak,
             self.model.forgetting_cap
         )
 
-        for lvl in list(self.M.keys()):
+
+        for level in list(self.M.keys()):
 
             peak = self.M_peak.get(
-                lvl,
-                self.M[lvl]
+                level,
+                self.M[level]
             )
 
-            floor = (
+
+            retention_floor = (
                 self.model.mastery_retention_floor
                 * peak
             )
 
-            self.M[lvl] = max(
-                floor,
-                self.M[lvl] - forgetting
+
+            self.M[level] = max(
+                retention_floor,
+                self.M[level] - forgetting_amount
             )
 
-    def update_attributes(self):
-        """
-        课后更新学生状态。
-        """
 
-        # 已经永久退出的早期学生不再演化
+    # ========================================================
+    # POST-CLASS UPDATE
+    # ========================================================
+
+    def update_attributes(self):
+
         if not self.active:
             return
 
-        # -------------------------
-        # 缺课
-        # -------------------------
+
+        # ----------------------------------------------------
+        # Absent
+        # ----------------------------------------------------
+
         if self.Y == 0:
 
-            # 只有稳定学生的缺课属于正常 absence
-            # 早期学生未连续回来已经在 attend() 中 dropped
-            if self.C >= 3:
+            # Any student who has attended before
+            # can forget previously learned material.
+            if self.C > 0:
                 self.forget()
 
             return
 
-        # -------------------------
-        # 到场
-        # -------------------------
 
-        # 回来上课后，连续缺课次数归零
+        # ----------------------------------------------------
+        # Attended
+        # ----------------------------------------------------
+
         self.absence_streak = 0
+        self.early_absence_streak = 0
 
-        # 累计实际上课次数
+
         self.C += 1
 
-        # 基础能力缓慢积累
+
+        # ----------------------------------------------------
+        # Delayed return -> stable
+        # ----------------------------------------------------
+
+        if (
+            self.C >= 3
+            and self.had_delayed_return
+        ):
+
+            self.stable_after_delayed_return = True
+
+
+        # ----------------------------------------------------
+        # B growth
+        # ----------------------------------------------------
+
         self.B = min(
             self.model.B_max,
             self.B + self.model.eta_B
         )
 
-        # 教学内化效率增长
-        #
-        # 完整上完6节课以后，
-        # 从第7次出勤开始进入高速增长阶段。
-        if self.C <= self.model.internalization_acceleration_after:
-            growth = self.model.eta_E_low
+
+        # ----------------------------------------------------
+        # E growth
+        # ----------------------------------------------------
+
+        if (
+            self.C
+            <= self.model.internalization_acceleration_after
+        ):
+
+            efficiency_growth = (
+                self.model.eta_E_low
+            )
+
         else:
-            growth = self.model.eta_E_high
+
+            efficiency_growth = (
+                self.model.eta_E_high
+            )
+
 
         self.E = min(
             1.0,
-            self.E + growth
+            self.E + efficiency_growth
         )
+
 
 
 class Teacher(mesa.Agent):
+
     def __init__(self, unique_id, model):
-        super().__init__(unique_id, model)
 
-        # 长期课程进度
-        self.L = 1
-
-        # 本节实际教学难度
-        self.D = 1
-
-        # 上节课给出的长期升级许可
-        self.U = 0
-
-        # 累计长期升级次数
-        self.upgrade_count = 0
-
-    def decide_level(self, R_t):
-        """
-        课前决定：
-
-        1. 是否推进长期课程等级 L；
-        2. 本节实际教学难度 D。
-
-        如果新人超过一半：
-        - 不升级长期等级；
-        - 当堂难度临时下降一个level。
-        """
-
-        newcomer_heavy = (
-            R_t > self.model.newcomer_difficulty_threshold
+        super().__init__(
+            unique_id,
+            model
         )
 
-        # 长期升级
-        if self.U == 1 and not newcomer_heavy:
+        # Long-term curriculum level
+        self.L = 1
+
+        # Actual teaching level this class
+        self.D = 1
+
+        # Persistent upgrade readiness
+        self.U = 0
+
+        self.upgrade_count = 0
+
+
+    # ========================================================
+    # DECIDE CURRENT TEACHING LEVEL
+    # ========================================================
+
+    def decide_level(self, new_ratio):
+
+        newcomer_heavy = (
+            new_ratio
+            > self.model.newcomer_difficulty_threshold
+        )
+
+
+        # Consume existing upgrade permission
+        if (
+            self.U == 1
+            and not newcomer_heavy
+        ):
+
             self.L += 1
+
             self.upgrade_count += 1
 
-        # 本节实际教学难度
+            self.U = 0
+
+
+        # Temporary teaching-level reduction
         if newcomer_heavy:
-            self.D = max(1, self.L - 1)
+
+            self.D = max(
+                1,
+                self.L - 1
+            )
+
         else:
+
             self.D = self.L
 
+
         return self.D
+
+
+    # ========================================================
+    # EVALUATE CLASS
+    # ========================================================
 
     def evaluate_and_permit(
         self,
         old_students,
-        teaching_level,
+        long_term_level,
         newcomer_heavy
     ):
-        """
-        课后评价所有“以前来过”的学生。
 
-        只要以前来过一次，
-        老师就认为是老生。
-
-        如果本节新人超过一半，
-        本节不产生新的长期升级许可。
-        """
-
+        # No old students:
+        # do not clear existing Permission
         if len(old_students) == 0:
-            self.U = 0
-            return 0.0
 
-        avg_mastery = np.mean([
-            s.M.get(teaching_level, 0)
-            for s in old_students
-        ])
+            return 0.0, 0.0
 
-        # 新生占多数的课堂：
-        # 即使老生在较低难度表现不错，
-        # 也不据此决定长期升级
+
+        # ----------------------------------------------------
+        # Latent mastery
+        # ----------------------------------------------------
+
+        mastery_ratios = [
+            student.mastery_ratio(
+                long_term_level
+            )
+            for student in old_students
+        ]
+
+
+        avg_mastery_ratio = np.mean(
+            mastery_ratios
+        )
+
+
+        # ----------------------------------------------------
+        # Observed performance
+        # ----------------------------------------------------
+
+        performance_ratios = [
+            student.performance_ratio(
+                long_term_level
+            )
+            for student in old_students
+        ]
+
+
+        avg_performance_ratio = np.mean(
+            performance_ratios
+        )
+
+
+        # ----------------------------------------------------
+        # Newcomer-heavy class:
+        #
+        # Report long-term-level mastery/performance,
+        # but do not create new upgrade permission.
+        # Existing Permission remains unchanged.
+        # ----------------------------------------------------
+
         if newcomer_heavy:
-            self.U = 0
-        else:
-            self.U = (
-                1
-                if avg_mastery
-                >= self.model.mastery_threshold
-                else 0
+
+            return (
+                avg_mastery_ratio * 100,
+                avg_performance_ratio * 100
             )
 
-        return avg_mastery
+
+        # Teacher judges observed performance
+        if (
+            avg_performance_ratio
+            >= self.model.mastery_threshold_ratio
+        ):
+
+            self.U = 1
+
+
+        return (
+            avg_mastery_ratio * 100,
+            avg_performance_ratio * 100
+        )
